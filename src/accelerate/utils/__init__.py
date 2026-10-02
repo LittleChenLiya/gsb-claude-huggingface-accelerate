@@ -14,6 +14,8 @@
 from ..parallelism_config import ParallelismConfig
 from .ao import convert_model_to_fp8_ao, filter_first_and_last_linear_layers, has_ao_layers
 from .constants import (
+    CHECKPOINT_MANIFEST_NAME,
+    CHECKPOINT_MANIFEST_VERSION,
     MITA_PROFILING_AVAILABLE_PYTORCH_VERSION,
     MODEL_NAME,
     OPTIMIZER_NAME,

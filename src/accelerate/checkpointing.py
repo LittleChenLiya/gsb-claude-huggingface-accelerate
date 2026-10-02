@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
 import random
 from pathlib import Path
 from typing import Optional
@@ -21,6 +23,8 @@ import torch
 from safetensors.torch import load_model
 
 from .utils import (
+    CHECKPOINT_MANIFEST_NAME,
+    CHECKPOINT_MANIFEST_VERSION,
     MODEL_NAME,
     OPTIMIZER_NAME,
     RNG_STATE_NAME,
@@ -58,6 +62,147 @@ from .state import PartialState
 
 
 logger = get_logger(__name__)
+
+
+class CheckpointManifestError(RuntimeError):
+    """
+    Raised when a checkpoint fails manifest verification: one or more files listed in the checkpoint
+    manifest are missing or corrupted.
+
+    When this exception is raised, verification happens *before* any model/optimizer state is loaded,
+    so the current in-memory model state is never overwritten by a damaged checkpoint.
+    """
+
+
+def _sha256_of_file(file_path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """
+    Computes the SHA-256 hexadecimal digest of a file, reading it in chunks so even large checkpoints
+    do not need to be fully loaded into memory.
+    """
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_checkpoint_manifest(output_dir: str | Path) -> Path:
+    """
+    Generates a complete manifest of all files contained in a checkpoint directory.
+
+    The manifest (`checkpoint_manifest.json`) lists every file with its size (in bytes) and SHA-256
+    checksum, alongside a total size summary. The manifest file itself is not included in the listing.
+    It is written after all checkpoint files have been saved, so it reflects the complete state of the
+    checkpoint at save time.
+
+    Args:
+        output_dir (`str` or `os.PathLike`):
+            The name of the checkpoint folder to scan.
+
+    Returns:
+        `Path`: The path to the written manifest file.
+    """
+    output_dir = Path(output_dir)
+    files = []
+    total_size_bytes = 0
+    for file_path in sorted(output_dir.glob("*")):
+        if not file_path.is_file() or file_path.name == CHECKPOINT_MANIFEST_NAME:
+            continue
+        size_bytes = file_path.stat().st_size
+        files.append(
+            {
+                "name": file_path.name,
+                "size_bytes": size_bytes,
+                "sha256": _sha256_of_file(file_path),
+            }
+        )
+        total_size_bytes += size_bytes
+
+    manifest = {
+        "manifest_version": CHECKPOINT_MANIFEST_VERSION,
+        "total_size_bytes": total_size_bytes,
+        "files": files,
+    }
+    manifest_path = output_dir.joinpath(CHECKPOINT_MANIFEST_NAME)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    logger.info(f"Checkpoint manifest saved in {manifest_path}: {len(files)} files, {total_size_bytes} bytes in total")
+    return manifest_path
+
+
+def verify_checkpoint_manifest(input_dir: str | Path) -> None:
+    """
+    Verifies the manifest of a saved checkpoint before loading.
+
+    Every file listed in the manifest must exist, have the expected size, and match its recorded SHA-256
+    checksum. Raises [`CheckpointManifestError`] if any file is missing or corrupted. Verification runs
+    *before* any model/optimizer state is loaded, so the current in-memory model state is never
+    overwritten by a damaged checkpoint.
+
+    If the directory does not contain a manifest (e.g. a checkpoint saved with an older version of the
+    library), verification is skipped and the checkpoint is loaded as before.
+
+    Args:
+        input_dir (`str` or `os.PathLike`):
+            The name of the checkpoint folder to verify.
+    """
+    input_dir = Path(input_dir)
+    manifest_path = input_dir.joinpath(CHECKPOINT_MANIFEST_NAME)
+    if not manifest_path.is_file():
+        logger.info(
+            f"No checkpoint manifest found in {input_dir}; skipping verification "
+            "(legacy checkpoint without a manifest)."
+        )
+        return
+
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+    except json.JSONDecodeError as e:
+        raise CheckpointManifestError(
+            f"Checkpoint manifest {manifest_path} is corrupted and cannot be read: {e}"
+        ) from e
+
+    errors = []
+    for file_info in manifest.get("files", []):
+        name = file_info.get("name")
+        if not name:
+            errors.append("manifest entry without a file name")
+            continue
+        file_path = input_dir.joinpath(name)
+        if not file_path.is_file():
+            errors.append(f"missing file: {name}")
+            continue
+        size_bytes = file_path.stat().st_size
+        expected_size = file_info.get("size_bytes")
+        if size_bytes != expected_size:
+            errors.append(
+                f"size mismatch for {name}: manifest records {expected_size} bytes, found {size_bytes} bytes"
+            )
+            continue
+        expected_sha256 = file_info.get("sha256")
+        if expected_sha256 is not None and _sha256_of_file(file_path) != expected_sha256:
+            errors.append(f"checksum mismatch for {name}: the file is corrupted")
+
+    if errors:
+        raise CheckpointManifestError(
+            f"Checkpoint verification failed for {input_dir}; refusing to load the checkpoint to avoid "
+            "overwriting the current model state:\n- " + "\n- ".join(errors)
+        )
+    logger.info(
+        f"Checkpoint manifest verified successfully for {input_dir} "
+        f"({len(manifest.get('files', []))} files, {manifest.get('total_size_bytes', 'unknown')} bytes in total)"
+    )
+
+
+def _should_write_manifest(save_on_each_node: bool) -> bool:
+    """
+    Whether the current process should write the checkpoint manifest, mirroring the process guard used by
+    the `save` helper so the manifest is written exactly once per checkpoint folder.
+    """
+    return (PartialState().is_main_process and not save_on_each_node) or (
+        PartialState().is_local_main_process and save_on_each_node
+    )
 
 
 def save_accelerator_state(
@@ -177,6 +322,10 @@ def save_accelerator_state(
     output_states_file = output_dir.joinpath(states_name)
     torch.save(states, output_states_file)
     logger.info(f"Random states saved in {output_states_file}")
+    # Write the complete checkpoint manifest (full file list + size/checksum summary) after all files
+    # have been saved, so loading can verify the checkpoint before touching any model state.
+    if _should_write_manifest(save_on_each_node):
+        write_checkpoint_manifest(output_dir)
     return output_dir
 
 
@@ -235,6 +384,10 @@ def load_accelerator_state(
         load_kwargs = {}
 
     input_dir = Path(input_dir)
+    # Verify the checkpoint manifest before loading anything. If a file is missing or corrupted this
+    # raises before any model/optimizer state is loaded, so the current model state is not overwritten.
+    # Legacy checkpoints without a manifest are skipped and load as before.
+    verify_checkpoint_manifest(input_dir)
     # Model states
     for i, model in enumerate(models):
         ending = f"_{i}" if i > 0 else ""
@@ -328,6 +481,9 @@ def save_custom_state(obj, path: str, index: int = 0, save_on_each_node: bool = 
     save_location = Path(path) / f"custom_checkpoint_{index}.pkl"
     logger.info(f"Saving the state of {get_pretty_name(obj)} to {save_location}")
     save(obj.state_dict(), save_location, save_on_each_node=save_on_each_node)
+    # Refresh the manifest so it also includes the custom checkpoint with its size and checksum.
+    if _should_write_manifest(save_on_each_node):
+        write_checkpoint_manifest(path)
 
 
 def load_custom_state(obj, path: str, index: int = 0) -> None:
