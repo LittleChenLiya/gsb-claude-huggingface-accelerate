@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
+import os
 import random
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +25,7 @@ import torch
 from safetensors.torch import load_model
 
 from .utils import (
+    CHECKPOINT_MANIFEST_NAME,
     MODEL_NAME,
     OPTIMIZER_NAME,
     RNG_STATE_NAME,
@@ -58,6 +63,158 @@ from .state import PartialState
 
 
 logger = get_logger(__name__)
+
+
+# Version of the checkpoint file manifest format written by this module.
+CHECKPOINT_MANIFEST_VERSION = 1
+# Size of the chunks used when hashing checkpoint files (1 MiB).
+_CHECKSUM_CHUNK_SIZE = 1024 * 1024
+
+
+class CheckpointIntegrityError(RuntimeError):
+    """Raised when a checkpoint manifest reports missing or corrupted files."""
+
+
+def _checksum_file(path: Path) -> str:
+    """Returns the SHA256 hex digest of the file located at `path`."""
+    file_hash = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(_CHECKSUM_CHUNK_SIZE), b""):
+            file_hash.update(chunk)
+    return file_hash.hexdigest()
+
+
+def _build_manifest_entry(path: Path) -> dict:
+    """Builds a single manifest entry (`size` and `sha256` checksum) for `path`."""
+    stat = path.stat()
+    return {"size": stat.st_size, "sha256": _checksum_file(path)}
+
+
+def _write_checkpoint_manifest(output_dir: Path, manifest_files: dict[str, dict]) -> Path:
+    """
+    Writes the checkpoint file manifest to `output_dir`.
+
+    The manifest is a JSON file containing a complete listing of every file that
+    belongs to the checkpoint together with its size in bytes and a SHA256
+    checksum. It is written atomically (a temporary file is flushed and then
+    renamed) so that an interrupted save cannot leave a half-written manifest.
+
+    Args:
+        output_dir (`Path`): The folder containing the checkpoint files.
+        manifest_files (`dict`): Mapping of relative file names to their entries.
+
+    Returns:
+        `Path`: The location of the written manifest.
+    """
+    files = {name: manifest_files[name] for name in sorted(manifest_files)}
+    manifest = {
+        "format_version": CHECKPOINT_MANIFEST_VERSION,
+        "total_files": len(files),
+        "total_size": sum(entry["size"] for entry in files.values()),
+        "files": files,
+    }
+    manifest_file = output_dir.joinpath(CHECKPOINT_MANIFEST_NAME)
+    # Write to a temporary file in the same directory and atomically replace the
+    # manifest so a crashed/interrupted save cannot corrupt a previous manifest.
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=output_dir, prefix=f".{CHECKPOINT_MANIFEST_NAME}.", suffix=".tmp", delete=False
+    ) as tmp_file:
+        json.dump(manifest, tmp_file, indent=2, sort_keys=True)
+        tmp_file.flush()
+        os.fsync(tmp_file.fileno())
+        tmp_name = tmp_file.name
+    os.replace(tmp_name, manifest_file)
+    return manifest_file
+
+
+def _collect_checkpoint_files(
+    output_dir: Path, manifest_files: dict[str, dict], save_on_each_node: bool = False
+) -> None:
+    """
+    Adds every checkpoint file that exists in `output_dir` (but is not yet listed)
+    to `manifest_files`.
+
+    This is used to collect files written independently by each process (such as
+    the per-process `random_states_<rank>.pkl` files) and files saved through
+    [`save_custom_state`].
+    """
+    state = PartialState()
+    is_writing_process = state.is_local_main_process if save_on_each_node else state.is_main_process
+    if not is_writing_process:
+        return
+    for path in sorted(output_dir.glob("*")):
+        if not path.is_file() or path.name == CHECKPOINT_MANIFEST_NAME:
+            continue
+        relative_name = path.name
+        if relative_name not in manifest_files:
+            manifest_files[relative_name] = _build_manifest_entry(path)
+
+
+def verify_checkpoint_integrity(input_dir: str | os.PathLike) -> None:
+    """
+    Verifies the integrity of a checkpoint directory against its file manifest.
+
+    Every file listed in `checkpoint_manifest.json` must exist, have the expected
+    size and match the recorded SHA256 checksum. All detected problems are
+    collected and reported together so that no state is loaded from a checkpoint
+    that is missing files or contains corrupted/tampered files.
+
+    Checkpoints saved by older versions of Accelerate do not contain a manifest;
+    in that case a warning is logged and loading proceeds as before.
+
+    Args:
+        input_dir (`str` or `os.PathLike`): The folder containing the checkpoint.
+
+    Raises:
+        [`CheckpointIntegrityError`]: If at least one listed file is missing, has
+        an unexpected size or fails the checksum check.
+    """
+    input_dir = Path(input_dir)
+    manifest_file = input_dir.joinpath(CHECKPOINT_MANIFEST_NAME)
+    if not manifest_file.exists():
+        logger.warning(
+            f"No checkpoint file manifest ({CHECKPOINT_MANIFEST_NAME}) found in {input_dir}. "
+            "This checkpoint was likely saved with an older version of Accelerate; "
+            "skipping integrity verification and loading it without a manifest."
+        )
+        return
+    try:
+        with open(manifest_file, encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        raise CheckpointIntegrityError(
+            f"Checkpoint manifest {manifest_file} could not be read ({e}); refusing to load the checkpoint. "
+            "The checkpoint may be corrupted."
+        ) from e
+
+    problems = []
+    files = manifest.get("files", {})
+    if not isinstance(files, dict) or not files:
+        problems.append("the manifest does not list any checkpoint files")
+    for relative_name in sorted(files):
+        entry = files[relative_name] or {}
+        path = input_dir.joinpath(relative_name)
+        if not path.exists():
+            problems.append(f"missing file: {relative_name}")
+            continue
+        actual_size = path.stat().st_size
+        expected_size = entry.get("size")
+        if expected_size is not None and actual_size != expected_size:
+            problems.append(
+                f"size mismatch for {relative_name}: expected {expected_size} bytes, found {actual_size} bytes"
+            )
+            continue
+        expected_checksum = entry.get("sha256")
+        if expected_checksum is not None:
+            actual_checksum = _checksum_file(path)
+            if actual_checksum != expected_checksum:
+                problems.append(f"checksum mismatch for {relative_name}: file is corrupted or has been modified")
+    if problems:
+        details = "\n\t".join(problems)
+        raise CheckpointIntegrityError(
+            f"Checkpoint in {input_dir} failed integrity verification; no model state was loaded:\n\t{details}"
+        )
+    logger.info(f"Checkpoint manifest verification passed for {input_dir} ({len(files)} files)")
 
 
 def save_accelerator_state(
@@ -105,6 +262,15 @@ def save_accelerator_state(
             Whether to save the model using `safetensors` or the traditional PyTorch way (that uses `pickle`).
     """
     output_dir = Path(output_dir)
+    # Files written as part of this checkpoint, collected for the file manifest.
+    manifest_files: dict[str, dict] = {}
+
+    def record_saved_file(path: Path):
+        state = PartialState()
+        is_writing_process = state.is_local_main_process if save_on_each_node else state.is_main_process
+        if is_writing_process and path.exists():
+            manifest_files[path.name] = _build_manifest_entry(path)
+
     # Model states
     for i, state in enumerate(model_states):
         weights_name = WEIGHTS_NAME if not safe_serialization else SAFE_WEIGHTS_NAME
@@ -112,6 +278,7 @@ def save_accelerator_state(
             weights_name = weights_name.replace(".", f"_{i}.")
         output_model_file = output_dir.joinpath(weights_name)
         save(state, output_model_file, save_on_each_node=save_on_each_node, safe_serialization=safe_serialization)
+        record_saved_file(output_model_file)
         logger.info(f"Model weights saved in {output_model_file}")
     # Optimizer states
     for i, opt in enumerate(optimizers):
@@ -119,6 +286,7 @@ def save_accelerator_state(
         optimizer_name = f"{OPTIMIZER_NAME}.bin" if i == 0 else f"{OPTIMIZER_NAME}_{i}.bin"
         output_optimizer_file = output_dir.joinpath(optimizer_name)
         save(state, output_optimizer_file, save_on_each_node=save_on_each_node, safe_serialization=False)
+        record_saved_file(output_optimizer_file)
         logger.info(f"Optimizer state saved in {output_optimizer_file}")
     # Scheduler states
     for i, scheduler in enumerate(schedulers):
@@ -126,6 +294,7 @@ def save_accelerator_state(
         scheduler_name = f"{SCHEDULER_NAME}.bin" if i == 0 else f"{SCHEDULER_NAME}_{i}.bin"
         output_scheduler_file = output_dir.joinpath(scheduler_name)
         save(state, output_scheduler_file, save_on_each_node=save_on_each_node, safe_serialization=False)
+        record_saved_file(output_scheduler_file)
         logger.info(f"Scheduler state saved in {output_scheduler_file}")
     # DataLoader states
     for i, dataloader in enumerate(dataloaders):
@@ -138,11 +307,13 @@ def save_accelerator_state(
             sampler = dataloader.get_sampler()
             if isinstance(sampler, SeedableRandomSampler):
                 save(sampler, output_sampler_file, save_on_each_node=save_on_each_node, safe_serialization=False)
+                record_saved_file(output_sampler_file)
         if getattr(dataloader, "use_stateful_dataloader", False):
             dataloader_state_dict_name = "dl_state_dict.bin" if i == 0 else f"dl_state_dict_{i}.bin"
             output_dataloader_state_dict_file = output_dir.joinpath(dataloader_state_dict_name)
             state_dict = dataloader.state_dict()
             torch.save(state_dict, output_dataloader_state_dict_file)
+            record_saved_file(output_dataloader_state_dict_file)
         logger.info(f"Sampler state for dataloader {i} saved in {output_sampler_file}")
 
     # GradScaler state
@@ -150,6 +321,7 @@ def save_accelerator_state(
         state = scaler.state_dict()
         output_scaler_file = output_dir.joinpath(SCALER_NAME)
         torch.save(state, output_scaler_file)
+        record_saved_file(output_scaler_file)
         logger.info(f"Gradient scaler state saved in {output_scaler_file}")
     # Random number generator states
     states = {}
@@ -177,6 +349,20 @@ def save_accelerator_state(
     output_states_file = output_dir.joinpath(states_name)
     torch.save(states, output_states_file)
     logger.info(f"Random states saved in {output_states_file}")
+
+    # Wait for every process to finish writing its own files (e.g. the
+    # per-process `random_states_<rank>.pkl`) before building the manifest.
+    PartialState().wait_for_everyone()
+    # Pick up files saved independently by other processes (and any custom
+    # states already saved in this directory).
+    _collect_checkpoint_files(output_dir, manifest_files, save_on_each_node=save_on_each_node)
+    writing_state = PartialState()
+    is_writing_process = (
+        writing_state.is_local_main_process if save_on_each_node else writing_state.is_main_process
+    )
+    if is_writing_process:
+        manifest_file = _write_checkpoint_manifest(output_dir, manifest_files)
+        logger.info(f"Checkpoint file manifest saved in {manifest_file}")
     return output_dir
 
 
@@ -235,6 +421,12 @@ def load_accelerator_state(
         load_kwargs = {}
 
     input_dir = Path(input_dir)
+    # Verify the complete checkpoint file manifest *before* touching any model,
+    # optimizer or RNG state. If any listed file is missing or corrupted this
+    # raises and the currently loaded states are left untouched. Checkpoints
+    # produced by older versions of Accelerate (no manifest) still load as
+    # before, with only a warning.
+    verify_checkpoint_integrity(input_dir)
     # Model states
     for i, model in enumerate(models):
         ending = f"_{i}" if i > 0 else ""
@@ -328,6 +520,23 @@ def save_custom_state(obj, path: str, index: int = 0, save_on_each_node: bool = 
     save_location = Path(path) / f"custom_checkpoint_{index}.pkl"
     logger.info(f"Saving the state of {get_pretty_name(obj)} to {save_location}")
     save(obj.state_dict(), save_location, save_on_each_node=save_on_each_node)
+
+    # Register this custom file in the checkpoint manifest (creating it if
+    # there is no accelerator-level state in this directory).
+    state = PartialState()
+    is_writing_process = state.is_local_main_process if save_on_each_node else state.is_main_process
+    if is_writing_process and save_location.exists():
+        output_dir = save_location.parent
+        manifest_file = output_dir.joinpath(CHECKPOINT_MANIFEST_NAME)
+        manifest_files = {}
+        if manifest_file.exists():
+            try:
+                with open(manifest_file, encoding="utf-8") as f:
+                    manifest_files = json.load(f).get("files", {})
+            except (json.JSONDecodeError, OSError):
+                manifest_files = {}
+        manifest_files[save_location.name] = _build_manifest_entry(save_location)
+        _write_checkpoint_manifest(output_dir, manifest_files)
 
 
 def load_custom_state(obj, path: str, index: int = 0) -> None:

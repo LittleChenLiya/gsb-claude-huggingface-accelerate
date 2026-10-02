@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import json
 import logging
 import os
 import random
@@ -28,6 +29,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from accelerate import Accelerator
+from accelerate.checkpointing import CHECKPOINT_MANIFEST_VERSION, CheckpointIntegrityError
 from accelerate.test_utils import (
     DEFAULT_LAUNCH_COMMAND,
     execute_subprocess_async,
@@ -36,7 +38,13 @@ from accelerate.test_utils import (
     run_first,
 )
 from accelerate.test_utils.testing import AccelerateTestCase
-from accelerate.utils import DistributedType, ProjectConfiguration, patch_environment, set_seed
+from accelerate.utils import (
+    CHECKPOINT_MANIFEST_NAME,
+    DistributedType,
+    ProjectConfiguration,
+    patch_environment,
+    set_seed,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -85,6 +93,19 @@ class DummyModel(nn.Module):
 
     def forward(self, x):
         return x * self.a + self.b
+
+
+class DummyStatefulObject:
+    "Minimal object with `state_dict`/`load_state_dict` that can be registered for checkpointing."
+
+    def __init__(self):
+        self.value = torch.arange(4, dtype=torch.float32)
+
+    def state_dict(self):
+        return {"value": self.value}
+
+    def load_state_dict(self, state_dict):
+        self.value = state_dict["value"]
 
 
 def parameterized_custom_name_func(func, param_num, param):
@@ -375,6 +396,164 @@ class CheckpointTest(AccelerateTestCase):
             assert not os.path.exists(os.path.join(tmpdir, "checkpoints", "checkpoint_0"))
             assert os.path.exists(os.path.join(tmpdir, "checkpoints", "checkpoint_9"))
             assert os.path.exists(os.path.join(tmpdir, "checkpoints", "checkpoint_10"))
+
+    def _make_pretrained_accelerator(self, tmpdir, name="ckpt", train_steps=2):
+        """Prepares a model/optimizer/dataloader, trains for a few steps and saves a checkpoint."""
+        set_seed(42)
+        model = DummyModel()
+        optimizer = torch.optim.Adam(params=model.parameters(), lr=1e-3)
+        train_dataloader, valid_dataloader = dummy_dataloaders()
+        accelerator = Accelerator()
+        model, optimizer, train_dataloader, valid_dataloader = accelerator.prepare(
+            model, optimizer, train_dataloader, valid_dataloader
+        )
+        train(train_steps, model, train_dataloader, optimizer, accelerator)
+        checkpoint = os.path.join(tmpdir, name)
+        accelerator.save_state(checkpoint, safe_serialization=self.use_safetensors)
+        accelerator.wait_for_everyone()
+        return accelerator, model, optimizer, checkpoint
+
+    @staticmethod
+    def _model_weight_file(checkpoint):
+        weight_suffixes = (".safetensors", ".bin")
+        excluded = ("optimizer", "scheduler", "sampler")
+        for candidate in os.listdir(checkpoint):
+            if candidate.endswith(weight_suffixes) and not any(name in candidate for name in excluded):
+                return os.path.join(checkpoint, candidate)
+        raise FileNotFoundError(f"No model weights file found in {checkpoint}")
+
+    def test_manifest_is_saved_with_file_listing_and_size_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, _, _, checkpoint = self._make_pretrained_accelerator(tmpdir)
+            manifest_path = os.path.join(checkpoint, CHECKPOINT_MANIFEST_NAME)
+            assert os.path.exists(manifest_path)
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+
+            assert manifest["format_version"] == CHECKPOINT_MANIFEST_VERSION
+            listed_files = manifest["files"]
+            # Every non-manifest file in the directory must be listed and only those.
+            on_disk = {name for name in os.listdir(checkpoint) if name != CHECKPOINT_MANIFEST_NAME}
+            assert set(listed_files) == on_disk
+            for name, entry in listed_files.items():
+                assert entry["size"] == os.path.getsize(os.path.join(checkpoint, name))
+                assert len(entry["sha256"]) == 64  # SHA256 hex digest
+            assert manifest["total_files"] == len(listed_files)
+            assert manifest["total_size"] == sum(entry["size"] for entry in listed_files.values())
+
+    def test_manifest_verifies_on_clean_load(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, trained_model, _, checkpoint = self._make_pretrained_accelerator(tmpdir)
+            expected_a, expected_b = trained_model.a.item(), trained_model.b.item()
+
+            # A fresh model loads the verified checkpoint and recovers the weights.
+            set_seed(0)
+            model = DummyModel()
+            optimizer = torch.optim.Adam(params=model.parameters(), lr=1e-3)
+            train_dataloader, valid_dataloader = dummy_dataloaders()
+            accelerator = Accelerator()
+            model, optimizer, train_dataloader, valid_dataloader = accelerator.prepare(
+                model, optimizer, train_dataloader, valid_dataloader
+            )
+            accelerator.load_state(checkpoint)
+            assert model.a.item() == expected_a
+            assert model.b.item() == expected_b
+
+    def _assert_load_aborts_and_weights_untouched(self, checkpoint):
+        """Attempts to load a damaged checkpoint and asserts current weights survive."""
+        set_seed(0)
+        model = DummyModel()
+        optimizer = torch.optim.Adam(params=model.parameters(), lr=1e-3)
+        train_dataloader, valid_dataloader = dummy_dataloaders()
+        accelerator = Accelerator()
+        model, optimizer, train_dataloader, valid_dataloader = accelerator.prepare(
+            model, optimizer, train_dataloader, valid_dataloader
+        )
+        untrained_a, untrained_b = model.a.detach().clone(), model.b.detach().clone()
+        with pytest.raises(CheckpointIntegrityError):
+            accelerator.load_state(checkpoint)
+        # The existing model state must not have been overwritten by the bad checkpoint.
+        torch.testing.assert_close(model.a.detach().cpu(), untrained_a)
+        torch.testing.assert_close(model.b.detach().cpu(), untrained_b)
+
+    def test_missing_checkpoint_file_does_not_overwrite_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, _, _, checkpoint = self._make_pretrained_accelerator(tmpdir)
+            # Delete the optimizer state (any single missing file must abort the load).
+            os.remove(os.path.join(checkpoint, "optimizer.bin"))
+            self._assert_load_aborts_and_weights_untouched(checkpoint)
+
+    def test_truncated_checkpoint_file_does_not_overwrite_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, _, _, checkpoint = self._make_pretrained_accelerator(tmpdir)
+            # Corrupt (truncate) the model weights file: size check must catch it.
+            weight_file = self._model_weight_file(checkpoint)
+            with open(weight_file, "r+b") as f:
+                f.truncate(max(1, os.path.getsize(weight_file) // 2))
+            self._assert_load_aborts_and_weights_untouched(checkpoint)
+
+    def test_tampered_same_size_checkpoint_file_does_not_overwrite_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, _, _, checkpoint = self._make_pretrained_accelerator(tmpdir)
+            # Modify a byte in the middle without changing the file size: the SHA256
+            # checksum must detect the tampering even though sizes still match.
+            weight_file = self._model_weight_file(checkpoint)
+            size = os.path.getsize(weight_file)
+            with open(weight_file, "r+b") as f:
+                f.seek(size // 2)
+                original = f.read(1)
+                f.seek(size // 2)
+                f.write(bytes([original[0] ^ 0xFF]))
+            assert os.path.getsize(weight_file) == size
+            self._assert_load_aborts_and_weights_untouched(checkpoint)
+
+    def test_corrupted_manifest_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, _, _, checkpoint = self._make_pretrained_accelerator(tmpdir)
+            with open(os.path.join(checkpoint, CHECKPOINT_MANIFEST_NAME), "w") as f:
+                f.write("{not valid json")
+            self._assert_load_aborts_and_weights_untouched(checkpoint)
+
+    def test_legacy_checkpoint_without_manifest_still_loads(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, trained_model, _, checkpoint = self._make_pretrained_accelerator(tmpdir)
+            expected_a, expected_b = trained_model.a.item(), trained_model.b.item()
+            # Simulate a checkpoint written by an older version of Accelerate.
+            os.remove(os.path.join(checkpoint, CHECKPOINT_MANIFEST_NAME))
+
+            set_seed(0)
+            model = DummyModel()
+            optimizer = torch.optim.Adam(params=model.parameters(), lr=1e-3)
+            train_dataloader, valid_dataloader = dummy_dataloaders()
+            accelerator = Accelerator()
+            model, optimizer, train_dataloader, valid_dataloader = accelerator.prepare(
+                model, optimizer, train_dataloader, valid_dataloader
+            )
+            # Must not raise despite the missing manifest.
+            accelerator.load_state(checkpoint)
+            assert model.a.item() == expected_a
+            assert model.b.item() == expected_b
+
+    def test_custom_registered_object_is_listed_in_manifest(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_seed(42)
+            model = DummyModel()
+            optimizer = torch.optim.Adam(params=model.parameters(), lr=1e-3)
+            train_dataloader, valid_dataloader = dummy_dataloaders()
+            accelerator = Accelerator()
+            model, optimizer, train_dataloader, valid_dataloader = accelerator.prepare(
+                model, optimizer, train_dataloader, valid_dataloader
+            )
+            tensor = DummyStatefulObject()
+            accelerator.register_for_checkpointing(tensor)
+            checkpoint = os.path.join(tmpdir, "ckpt")
+            accelerator.save_state(checkpoint, safe_serialization=self.use_safetensors)
+            accelerator.wait_for_everyone()
+            with open(os.path.join(checkpoint, CHECKPOINT_MANIFEST_NAME), encoding="utf-8") as f:
+                manifest = json.load(f)
+            assert "custom_checkpoint_0.pkl" in manifest["files"]
+            # And the manifest check passes on load.
+            accelerator.load_state(checkpoint)
 
     @run_first
     @require_non_cpu
