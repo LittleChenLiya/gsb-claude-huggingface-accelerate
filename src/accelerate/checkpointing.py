@@ -23,6 +23,7 @@ from safetensors.torch import load_model
 from .utils import (
     MODEL_NAME,
     OPTIMIZER_NAME,
+    RNG_STATE_DIGEST_KEY,
     RNG_STATE_NAME,
     SAFE_MODEL_NAME,
     SAFE_WEIGHTS_NAME,
@@ -30,6 +31,8 @@ from .utils import (
     SCALER_NAME,
     SCHEDULER_NAME,
     WEIGHTS_NAME,
+    RNGStateValidationError,
+    compute_rng_state_digest,
     get_pretty_name,
     is_cuda_available,
     is_hpu_available,
@@ -42,6 +45,7 @@ from .utils import (
     is_xpu_available,
     load,
     save,
+    validate_rng_state_digest,
 )
 
 
@@ -174,6 +178,9 @@ def save_accelerator_state(
         states["torch_cuda_manual_seed"] = torch.cuda.get_rng_state_all()
     if is_torch_xla_available():
         states["xm_seed"] = xm.get_rng_state()
+    # Attach a validation summary (digest of every generator state plus the rank that produced them) so that restoring
+    # the states can detect rank/generator mismatches and corruption before any state is overwritten.
+    states[RNG_STATE_DIGEST_KEY] = compute_rng_state_digest(states, process_index)
     output_states_file = output_dir.joinpath(states_name)
     torch.save(states, output_states_file)
     logger.info(f"Random states saved in {output_states_file}")
@@ -292,6 +299,10 @@ def load_accelerator_state(
     # Random states
     try:
         states = load(input_dir.joinpath(f"{RNG_STATE_NAME}_{process_index}.pkl"))
+        # Validate the states before applying any of them: a rank/generator mismatch or corrupted state must not
+        # partially overwrite the running process' RNG state. Checkpoints saved in the old format (without a digest)
+        # are not validated and keep the legacy behavior.
+        validate_rng_state_digest(states, process_index)
         if "step" in states:
             override_attributes["step"] = states["step"]
         random.setstate(states["random_state"])
@@ -314,6 +325,10 @@ def load_accelerator_state(
         if is_torch_xla_available():
             xm.set_rng_state(states["xm_seed"])
         logger.info("All random states loaded successfully")
+    except RNGStateValidationError:
+        # Validation failure: the checkpoint does not belong to this process, a generator state is corrupted, or the
+        # summary was tampered with. Re-raise so the load is rejected; no RNG state has been overwritten.
+        raise
     except Exception:
         logger.info("Could not load random states")
 

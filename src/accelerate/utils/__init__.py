@@ -297,7 +297,15 @@ from .other import (
     wait_for_everyone,
     write_basic_config,
 )
-from .random import set_seed, synchronize_rng_state, synchronize_rng_states
+from .random import (
+    RNG_STATE_DIGEST_KEY,
+    RNGStateValidationError,
+    compute_rng_state_digest,
+    set_seed,
+    synchronize_rng_state,
+    synchronize_rng_states,
+    validate_rng_state_digest,
+)
 from .torch_xla import install_xla
 from .tqdm import tqdm
 from .transformer_engine import (

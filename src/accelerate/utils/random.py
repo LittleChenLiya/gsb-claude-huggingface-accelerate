@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import pickle
 import random
 from typing import Optional, Union
 
@@ -19,7 +21,7 @@ import numpy as np
 import torch
 
 from ..state import AcceleratorState
-from .constants import CUDA_DISTRIBUTED_TYPES
+from .constants import CUDA_DISTRIBUTED_TYPES, RNG_STATE_NAME
 from .dataclasses import DistributedType, RNGType
 from .imports import (
     is_hpu_available,
@@ -35,6 +37,144 @@ from .imports import (
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
+
+
+# Key under which a validation summary (digest) is stored alongside the saved RNG states.
+RNG_STATE_DIGEST_KEY = "rng_state_digest"
+
+
+class RNGStateValidationError(Exception):
+    """
+    Raised when RNG states restored from a checkpoint fail validation.
+
+    This typically means the checkpoint was saved by a different process (rank) than the one restoring it, one of the
+    generator states is corrupted, or the checkpoint was tampered with. When this is raised, no RNG state has been
+    overwritten yet, so the running process keeps its own random sequence.
+    """
+
+    pass
+
+
+def _rng_state_to_bytes(value) -> bytes:
+    """
+    Convert a single RNG state value to a canonical byte representation used for digests.
+
+    Torch tensors are hashed from their raw data because pickling a tensor embeds a non-deterministic storage id.
+    Numpy arrays are handled similarly. Lists and tuples are encoded element by element, and every other value falls
+    back to pickling (deterministic for the ints/strings that make up the rest of the RNG states).
+    """
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        return (
+            b"torch.Tensor:"
+            + str(tensor.dtype).encode("ascii")
+            + b":"
+            + str(tuple(tensor.shape)).encode("ascii")
+            + b":"
+            + tensor.numpy().tobytes()
+        )
+    if isinstance(value, np.ndarray):
+        return (
+            b"np.ndarray:"
+            + str(value.dtype).encode("ascii")
+            + b":"
+            + str(value.shape).encode("ascii")
+            + b":"
+            + value.tobytes()
+        )
+    if isinstance(value, (list, tuple)):
+        parts = [_rng_state_to_bytes(element) for element in value]
+        return type(value).__name__.encode("ascii") + b":" + b",".join(parts)
+    return b"pickle:" + pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def compute_rng_state_digest(states: dict, process_index: int) -> dict:
+    """
+    Compute a validation summary for the RNG states saved by `process_index`.
+
+    The summary records the rank of the process that produced the states and a SHA-256 digest of every individual
+    generator state. It is stored alongside the states and can be used on restore to detect rank mismatches (a
+    checkpoint saved by another rank) or generator mismatches / corruption.
+
+    Args:
+        states (`dict`):
+            The RNG states about to be saved. The digest key itself, if present, is ignored.
+        process_index (`int`):
+            The rank of the process saving the states.
+
+    Returns:
+        `dict`: The validation summary to store under `RNG_STATE_DIGEST_KEY`.
+    """
+    summary = {
+        "process_index": process_index,
+        "states": {
+            key: hashlib.sha256(_rng_state_to_bytes(value)).hexdigest()
+            for key, value in states.items()
+            if key != RNG_STATE_DIGEST_KEY
+        },
+    }
+    return summary
+
+
+def validate_rng_state_digest(states: dict, process_index: int) -> bool:
+    """
+    Validate the RNG states loaded from a checkpoint against the digest stored at save time.
+
+    Args:
+        states (`dict`):
+            The RNG states loaded from the checkpoint file.
+        process_index (`int`):
+            The rank of the process restoring the states.
+
+    Returns:
+        `bool`: Whether a validation summary was present and validated. `False` means the checkpoint was saved in the
+        old format without a digest and was not validated (backward compatible).
+
+    Raises:
+        `RNGStateValidationError`: If the states were saved by a different process, a generator state is missing, or a
+            generator state is corrupted / does not match. No RNG state has been applied yet when this is raised.
+    """
+    summary = states.get(RNG_STATE_DIGEST_KEY)
+    if summary is None:
+        # Old checkpoint format: no validation summary, skip validation for backward compatibility.
+        return False
+
+    if not isinstance(summary, dict):
+        raise RNGStateValidationError(
+            f"RNG state validation summary in the checkpoint restored by process {process_index} is malformed "
+            f"(expected a dict, got {type(summary).__name__}). No RNG state has been overwritten."
+        )
+
+    saved_process_index = summary.get("process_index")
+    if saved_process_index != process_index:
+        raise RNGStateValidationError(
+            f"RNG state mismatch: the checkpoint was saved by process {saved_process_index} but is being restored by "
+            f"process {process_index}. Each process must restore its own RNG state file "
+            f"(`{RNG_STATE_NAME}_{process_index}.pkl`). Restoring another rank's state would corrupt the random number "
+            "sequence. No RNG state has been overwritten."
+        )
+
+    saved_digests = summary.get("states")
+    if not isinstance(saved_digests, dict):
+        raise RNGStateValidationError(
+            f"RNG state validation summary in the checkpoint restored by process {process_index} is malformed "
+            "(missing the per-state digests). No RNG state has been overwritten."
+        )
+
+    for key, saved_digest in saved_digests.items():
+        if key not in states:
+            raise RNGStateValidationError(
+                f"RNG state mismatch: the generator state '{key}' is missing from the checkpoint being restored by "
+                f"process {process_index}. No RNG state has been overwritten."
+            )
+        current_digest = hashlib.sha256(_rng_state_to_bytes(states[key])).hexdigest()
+        if current_digest != saved_digest:
+            raise RNGStateValidationError(
+                f"RNG state mismatch: the generator state '{key}' restored by process {process_index} does not match "
+                "the state saved in the checkpoint. The checkpoint may be corrupted or was saved by a different "
+                "generator. No RNG state has been overwritten."
+            )
+    return True
 
 
 def set_seed(seed: int, device_specific: bool = False, deterministic: bool = False):
