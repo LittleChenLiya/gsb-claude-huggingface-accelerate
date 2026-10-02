@@ -273,6 +273,9 @@ class Accelerator:
         - **process_index** (`int`) -- The overall index of the current process among all processes.
         - **state** ([`~state.AcceleratorState`]) -- The distributed setup state.
         - **sync_gradients** (`bool`) -- Whether the gradients are currently being synced across all processes.
+        - **gradient_accumulation_window_complete** (`bool`) -- Whether the current gradient accumulation window has
+          completed with gradients actually being synchronized. Only `True` after an [`~Accelerator.accumulate`]
+          block exits without error on a step that synchronized gradients.
         - **use_distributed** (`bool`) -- Whether the current configuration is for distributed training.
     """
 
@@ -613,6 +616,8 @@ class Accelerator:
 
         # Start of internal step tracking
         self.step = 0
+        # Whether the last gradient accumulation window completed with an actual gradient synchronization
+        self._grad_accum_window_complete = False
 
         # Internal references to the training objects
         self._optimizers = []
@@ -1244,6 +1249,18 @@ class Accelerator:
         self.gradient_state.sync_gradients = sync_gradients
 
     @property
+    def gradient_accumulation_window_complete(self):
+        """
+        Whether the current gradient accumulation window has completed with gradients actually being synchronized.
+
+        This flag is only `True` after an [`~Accelerator.accumulate`] block exits without error on a step where
+        gradients were synchronized (i.e. the step on which an optimizer update should happen). It is reset to
+        `False` at the start of every new accumulation step, and it stays `False` if the block raised an exception or
+        was cancelled, so unsynchronized gradients are never reported as a completed window.
+        """
+        return self._grad_accum_window_complete
+
+    @property
     def gradient_accumulation_steps(self):
         return self.gradient_state.num_steps
 
@@ -1280,6 +1297,9 @@ class Accelerator:
         ```
         """
         self._do_sync()
+        # A new accumulation step starts: the window is only complete once this block
+        # exits successfully on a step that actually synchronizes gradients.
+        self._grad_accum_window_complete = False
 
         allow_gradient_sync = (
             self.sync_gradients  # must sync if sync gradients need to complete an optimizer step
@@ -1291,10 +1311,18 @@ class Accelerator:
                 and self.gradient_state.plugin_kwargs.get("sync_each_batch", False)
             )
         )
-        with contextlib.ExitStack() as cm_stack:
-            for m in models:
-                cm_stack.enter_context(contextlib.nullcontext() if allow_gradient_sync else self.no_sync(m))
-            yield
+        try:
+            with contextlib.ExitStack() as cm_stack:
+                for m in models:
+                    cm_stack.enter_context(contextlib.nullcontext() if allow_gradient_sync else self.no_sync(m))
+                yield
+        except BaseException:
+            # The window was interrupted (exception or cancellation) before finishing:
+            # never report unsynchronized gradients as a completed window.
+            self._grad_accum_window_complete = False
+            raise
+        # The window finished normally: it is complete only if gradients were actually synced this step.
+        self._grad_accum_window_complete = bool(self.sync_gradients)
 
     @contextmanager
     def join_uneven_inputs(self, joinables, even_batches=None):
@@ -3953,6 +3981,7 @@ class Accelerator:
         self._models = []
         self._dataloaders = []
         self.step = 0
+        self._grad_accum_window_complete = False
         return objects
 
     def clear(self, *objects):

@@ -203,6 +203,66 @@ class AcceleratorTester(AccelerateTestCase):
         assert state.sync_gradients is False
         GradientState._reset_state()
 
+    def test_gradient_accumulation_window_complete(self):
+        def make_accelerator(num_steps):
+            accelerator = Accelerator(gradient_accumulation_steps=num_steps)
+            model = torch.nn.Linear(8, 4)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            model, optimizer = accelerator.prepare(model, optimizer)
+            return accelerator, model
+
+        def train_step(accelerator, model):
+            loss = model(torch.randn(2, 8, device=accelerator.device)).sum()
+            accelerator.backward(loss)
+
+        # Normal path: three-step accumulation, the flag is only True on the syncing step
+        accelerator, model = make_accelerator(3)
+        assert accelerator.gradient_accumulation_window_complete is False
+        sync_count = 0
+        flags = []
+        for _ in range(6):
+            with accelerator.accumulate(model):
+                train_step(accelerator, model)
+                if accelerator.sync_gradients:
+                    sync_count += 1
+            flags.append(accelerator.gradient_accumulation_window_complete)
+        assert sync_count == 2
+        assert flags == [False, False, True, False, False, True]
+
+        # Failure path: an exception on a non-syncing step must not complete the window
+        with self.assertRaises(RuntimeError):
+            with accelerator.accumulate(model):
+                train_step(accelerator, model)
+                raise RuntimeError("boom")
+        assert accelerator.gradient_accumulation_window_complete is False
+
+        # Failure path: an exception on the syncing step must not complete the window either
+        with accelerator.accumulate(model):  # one more non-syncing step to reach the window boundary
+            train_step(accelerator, model)
+        assert accelerator.gradient_accumulation_window_complete is False
+        with self.assertRaises(RuntimeError):
+            with accelerator.accumulate(model):  # this step would synchronize gradients
+                assert accelerator.sync_gradients
+                train_step(accelerator, model)
+                raise RuntimeError("boom")
+        assert accelerator.gradient_accumulation_window_complete is False
+
+        # Cancellation path: a BaseException (e.g. KeyboardInterrupt) must not complete the window
+        with self.assertRaises(KeyboardInterrupt):
+            with accelerator.accumulate(model):
+                raise KeyboardInterrupt
+        assert accelerator.gradient_accumulation_window_complete is False
+
+        # Single-step training keeps its old behavior: every step syncs and completes its window
+        accelerator, model = make_accelerator(1)
+        for _ in range(2):
+            with accelerator.accumulate(model):
+                assert accelerator.sync_gradients
+                train_step(accelerator, model)
+            assert accelerator.gradient_accumulation_window_complete is True
+
+        GradientState._reset_state()
+
     def test_prepared_objects_are_referenced(self):
         accelerator = Accelerator()
         model, optimizer, scheduler, train_dl, valid_dl = create_components()
