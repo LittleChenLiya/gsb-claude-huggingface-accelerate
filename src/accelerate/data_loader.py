@@ -507,6 +507,99 @@ class DataLoaderAdapter:
             self.dl_state_dict["_iterator_finished"] = self.end_of_dataloader
 
 
+def _tail_batch_attribution(
+    dataset_length: int,
+    batch_size: Optional[int],
+    num_processes: int,
+    drop_last: bool = False,
+    even_batches: bool = True,
+    split_batches: bool = False,
+):
+    """
+    Computes the distributed tail-batch attribution report: for each rank, how many yielded samples are real samples
+    from the dataset and how many are padding samples (duplicated samples used to even out the last batch across
+    processes).
+
+    This is a purely arithmetic computation: it does not iterate any dataloader or sampler, so it cannot consume RNG
+    state or change the iteration order of any dataloader. Empty datasets and dataset lengths that are not a round
+    multiple of the (total) batch size therefore have deterministic values.
+
+    Args:
+        dataset_length (`int`):
+            The total number of samples in the dataset (across all processes).
+        batch_size (`int` or `None`):
+            The batch size of the underlying (unsharded) batch sampler.
+        num_processes (`int`):
+            The number of processes the batches are sharded over.
+        drop_last (`bool`, *optional*, defaults to `False`):
+            Whether the underlying batch sampler drops the last incomplete batch.
+        even_batches (`bool`, *optional*, defaults to `True`):
+            Whether the shards are evened out by padding the tail with samples from the beginning of the dataset.
+        split_batches (`bool`, *optional*, defaults to `False`):
+            Whether each batch is split across processes instead of dispatching whole batches per process.
+
+    Returns:
+        `list[dict]`: One entry per rank, each a dictionary with the keys `rank`, `real_samples` and
+        `padding_samples`.
+    """
+    if num_processes < 1:
+        raise ValueError(f"`num_processes` must be at least 1, got {num_processes}.")
+    report = [{"rank": rank, "real_samples": 0, "padding_samples": 0} for rank in range(num_processes)]
+    # Empty datasets deterministically attribute zero real and zero padding samples to every rank.
+    if dataset_length is None or dataset_length <= 0:
+        return report
+    if batch_size is None:
+        raise ValueError(
+            "The tail batch attribution report cannot be computed for batch samplers with a dynamic batch size "
+            "(`batch_size=None`)."
+        )
+    if batch_size <= 0:
+        raise ValueError(f"`batch_size` must be a positive integer, got {batch_size}.")
+
+    full_batches, tail = divmod(dataset_length, batch_size)
+
+    if split_batches:
+        shard_size = batch_size // num_processes
+        # Every full batch is split evenly across all ranks and never padded.
+        for rank in range(num_processes):
+            report[rank]["real_samples"] = full_batches * shard_size
+        if not drop_last and tail > 0:
+            # The incomplete tail batch is sliced the same way; ranks past its end get nothing (or padding when
+            # `even_batches=True`).
+            for rank in range(num_processes):
+                real = max(0, min(tail, (rank + 1) * shard_size) - rank * shard_size)
+                report[rank]["real_samples"] += real
+                if even_batches:
+                    report[rank]["padding_samples"] += shard_size - real
+        return report
+
+    # Whole batches are dispatched to ranks round-robin.
+    if drop_last:
+        # Incomplete rounds of `num_processes` batches are dropped as well, and there is never any padding.
+        batches_per_rank = full_batches // num_processes
+        for rank in range(num_processes):
+            report[rank]["real_samples"] = batches_per_rank * batch_size
+        return report
+
+    for batch_index in range(full_batches):
+        report[batch_index % num_processes]["real_samples"] += batch_size
+
+    if tail > 0:
+        if not even_batches:
+            # The short tail batch goes to its rank as-is, without any padding.
+            report[full_batches % num_processes]["real_samples"] += tail
+        else:
+            # The tail batch is padded up to `batch_size` and extra all-padding batches are yielded so that every
+            # rank yields the same number of batches.
+            total_batches = math.ceil((full_batches + 1) / num_processes) * num_processes
+            for batch_index in range(full_batches, total_batches):
+                rank = batch_index % num_processes
+                real = tail if batch_index == full_batches else 0
+                report[rank]["real_samples"] += real
+                report[rank]["padding_samples"] += batch_size - real
+    return report
+
+
 class DataLoaderShard(DataLoaderAdapter, DataLoaderStateMixin):
     """
     Subclass of `DataLoaderAdapter` that will deal with device placement and current distributed setup.
@@ -653,6 +746,40 @@ class DataLoaderShard(DataLoaderAdapter, DataLoaderStateMixin):
             return self.dataset.total_length
         else:
             return len(self.dataset)
+
+    def tail_batch_report(self):
+        """
+        Returns the distributed tail-batch attribution report for this dataloader: one entry per rank listing how many
+        samples that rank effectively yields from the dataset (`real_samples`) and how many are padding samples
+        (`padding_samples`, i.e. samples duplicated from the beginning of the dataset to even out the last batch
+        across processes).
+
+        The report is computed arithmetically from the dataset length and the sharding configuration: it does not
+        iterate the dataloader or its sampler, so calling it never consumes RNG state nor changes the iteration
+        order. Empty datasets and dataset lengths that are not a round multiple of the total batch size have
+        deterministic values (all zeros for empty datasets).
+
+        Returns:
+            `list[dict]`: One dictionary per rank with the keys `rank`, `real_samples` and `padding_samples`.
+
+        Example:
+
+        ```python
+        >>> dataloader = accelerator.prepare(DataLoader(range(5), batch_size=2))  # 2 processes
+        >>> dataloader.tail_batch_report()
+        [{'rank': 0, 'real_samples': 3, 'padding_samples': 1}, {'rank': 1, 'real_samples': 2, 'padding_samples': 2}]
+        ```
+        """
+        batch_sampler = self.sampler if isinstance(self.sampler, BatchSampler) else self.batch_sampler
+        return _tail_batch_attribution(
+            dataset_length=self.total_dataset_length,
+            batch_size=getattr(batch_sampler, "batch_size", None),
+            num_processes=getattr(batch_sampler, "num_processes", 1),
+            drop_last=getattr(batch_sampler, "drop_last", False),
+            # Only a `BatchSamplerShard` pads the tail batch; a plain `BatchSampler` yields it as-is.
+            even_batches=getattr(batch_sampler, "even_batches", False),
+            split_batches=getattr(batch_sampler, "split_batches", False),
+        )
 
     def get_sampler(self):
         return get_sampler(self)

@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 import random
+import sys
+import tempfile
 import weakref
 
 import pytest
@@ -34,8 +38,14 @@ from accelerate.data_loader import (
     skip_first_batches,
 )
 from accelerate.state import GradientState
-from accelerate.test_utils.testing import AccelerateTestCase, require_datasets, require_torchdata_stateful_dataloader
-from accelerate.utils import is_torchdata_stateful_dataloader_available, set_seed
+from accelerate.test_utils import execute_subprocess_async, path_in_accelerate_package
+from accelerate.test_utils.testing import (
+    AccelerateTestCase,
+    require_cpu,
+    require_datasets,
+    require_torchdata_stateful_dataloader,
+)
+from accelerate.utils import is_torchdata_stateful_dataloader_available, patch_environment, set_seed
 
 
 if is_torchdata_stateful_dataloader_available():
@@ -725,6 +735,36 @@ class DataLoaderTester(AccelerateTestCase):
         assert accelerator_ref() is None
         assert dataloader_ref() is None
         assert gradient_state_ref() is None
+
+    @require_cpu
+    def test_tail_batch_report_two_process_cpu(self):
+        # Local two-process CPU fixture: iterate a five-sample dataset (tail batch does not divide evenly across the
+        # two ranks) and an empty dataset, then check the distributed tail-batch attribution report dumped by each
+        # rank. The fixture script also checks that computing the report does not change the iteration order and
+        # replays the yielded batches to cross-check the per-rank real/padding attribution.
+        script = path_in_accelerate_package("test_utils", "scripts", "test_tail_batch_report.py")
+        expected_reports = {
+            "five_samples": [
+                {"rank": 0, "real_samples": 3, "padding_samples": 1},
+                {"rank": 1, "real_samples": 2, "padding_samples": 2},
+            ],
+            "empty": [
+                {"rank": 0, "real_samples": 0, "padding_samples": 0},
+                {"rank": 1, "real_samples": 0, "padding_samples": 0},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # The fixture script spawns the two CPU processes itself (file-store rendezvous, no Docker required).
+            cmd = [sys.executable, str(script)]
+            with patch_environment(ACCELERATE_TAIL_BATCH_REPORT_TMPDIR=tmp_dir):
+                execute_subprocess_async(cmd)
+            for rank in range(2):
+                with open(os.path.join(tmp_dir, f"rank{rank}.json")) as f:
+                    result = json.load(f)
+                for name, expected in expected_reports.items():
+                    assert result[name]["report"] == expected, (
+                        f"[{name}] report computed on rank {rank}: {result[name]['report']} != {expected}"
+                    )
 
 
 class StatefulDataLoaderTester(AccelerateTestCase):
