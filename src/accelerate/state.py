@@ -1243,6 +1243,11 @@ class GradientState:
         - **end_of_dataloader** (`bool`) -- Whether we have reached the end the current dataloader
         - **remainder** (`int`) -- The number of extra samples that were added from padding the dataloader
         - **sync_gradients** (`bool`) -- Whether the gradients should be synced across all devices
+        - **gradient_sync_complete** (`bool`) -- Whether the most recent gradient accumulation window
+          completed and gradients were actually synchronized across all devices this round. Reset to
+          `False` at the start of every accumulation context and only set to `True` when that context
+          exits normally with a gradient synchronization, so an interrupted or cancelled window is
+          never reported as complete.
         - **active_dataloader** (`Optional[DataLoader]`) -- The dataloader that is currently being iterated over
         - **dataloader_references** (`List[Optional[DataLoader]]`) -- A list of references to the dataloaders that are
             being iterated over
@@ -1263,6 +1268,10 @@ class GradientState:
         self.__dict__ = self._shared_state
         if not self.initialized:
             self.sync_gradients = True
+            # Whether the last accumulation window completed and gradients were synced this round.
+            # Reset at the start of each `accumulate` context and only set on a normal exit with a
+            # gradient sync, so an exception/cancellation can never leave a stale "complete" marker.
+            self._gradient_sync_complete = False
             self._dataloader_references_ref = [None]
             self.plugin_kwargs = (
                 gradient_accumulation_plugin.to_kwargs() if gradient_accumulation_plugin is not None else {}
@@ -1326,6 +1335,15 @@ class GradientState:
     def is_xla_gradients_synced(self, is_synced):
         "Set the _is_xla_gradients_synced attribute."
         self._is_xla_gradients_synced = is_synced
+
+    @property
+    def gradient_sync_complete(self) -> bool:
+        "Whether the most recent gradient accumulation window completed and gradients were actually synchronized this round."
+        return self._gradient_sync_complete
+
+    def _set_gradient_sync_complete(self, gradient_sync_complete: bool):
+        "Private function that sets whether the current accumulation window completed. Users should not have to call this."
+        self._gradient_sync_complete = gradient_sync_complete
 
     def _set_sync_gradients(self, sync_gradients):
         "Private function that sets whether gradients should be synchronized. Users should not have to call this."

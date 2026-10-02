@@ -273,6 +273,10 @@ class Accelerator:
         - **process_index** (`int`) -- The overall index of the current process among all processes.
         - **state** ([`~state.AcceleratorState`]) -- The distributed setup state.
         - **sync_gradients** (`bool`) -- Whether the gradients are currently being synced across all processes.
+        - **gradient_sync_complete** (`bool`) -- Whether the most recent gradient accumulation window completed
+          and gradients were actually synchronized across all processes this round. Only `True` after an
+          [`~Accelerator.accumulate`] context that exited normally with a gradient synchronization; it is reset
+          at the start of every context and is never set when the context raises or is cancelled.
         - **use_distributed** (`bool`) -- Whether the current configuration is for distributed training.
     """
 
@@ -1244,6 +1248,43 @@ class Accelerator:
         self.gradient_state.sync_gradients = sync_gradients
 
     @property
+    def gradient_sync_complete(self):
+        """
+        Whether the most recent gradient accumulation window completed and gradients were actually synchronized
+        across all processes this round.
+
+        This is `True` only after an [`~Accelerator.accumulate`] context that exited normally and performed a
+        gradient synchronization (i.e. the last step of an accumulation window). It is reset to `False` at the
+        start of every accumulation context and is never set when that context raises or is cancelled, so an
+        interrupted window can never be reported as complete. When `gradient_accumulation_steps` is `1`
+        (single-step training) this mirrors [`~Accelerator.sync_gradients`].
+
+        Example:
+
+        ```python
+        >>> from accelerate import Accelerator
+
+        >>> accelerator = Accelerator(gradient_accumulation_steps=4)
+        >>> dataloader, model, optimizer, scheduler = accelerator.prepare(dataloader, model, optimizer, scheduler)
+
+        >>> for input, target in dataloader:
+        ...     with accelerator.accumulate(model):
+        ...         outputs = model(input)
+        ...         loss = loss_func(outputs, target)
+        ...         accelerator.backward(loss)
+        ...         if accelerator.sync_gradients:
+        ...             accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+        ...         optimizer.step()
+        ...         scheduler.step()
+        ...         optimizer.zero_grad()
+        ...     if accelerator.gradient_sync_complete:
+        ...         # The accumulation window just finished: gradients were synced and the optimizer stepped.
+        ...         ...
+        ```
+        """
+        return self.gradient_state.gradient_sync_complete
+
+    @property
     def gradient_accumulation_steps(self):
         return self.gradient_state.num_steps
 
@@ -1291,10 +1332,26 @@ class Accelerator:
                 and self.gradient_state.plugin_kwargs.get("sync_each_batch", False)
             )
         )
+        # Reset the window-completion marker at the start of every accumulation context so that a value left
+        # over from a previous (possibly interrupted or cancelled) window can never be observed as complete.
+        # The marker is only set below when the context exits normally and gradients were actually synchronized
+        # this round.
+        self.gradient_state._set_gradient_sync_complete(False)
         with contextlib.ExitStack() as cm_stack:
             for m in models:
                 cm_stack.enter_context(contextlib.nullcontext() if allow_gradient_sync else self.no_sync(m))
-            yield
+            completed = False
+            try:
+                yield
+                completed = True
+            finally:
+                # Only a normal exit (no exception/cancellation) can complete the accumulation window. If the
+                # block raises or is cancelled (e.g. KeyboardInterrupt), `completed` stays False and gradients
+                # are not marked as synchronized.
+                if completed and allow_gradient_sync:
+                    # The accumulation window completed normally and gradients were synchronized across all
+                    # processes this round.
+                    self.gradient_state._set_gradient_sync_complete(True)
 
     @contextmanager
     def join_uneven_inputs(self, joinables, even_batches=None):
