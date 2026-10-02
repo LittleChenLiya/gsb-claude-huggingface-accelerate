@@ -18,7 +18,7 @@ import weakref
 import pytest
 import torch
 from parameterized import parameterized
-from torch.utils.data import BatchSampler, DataLoader, IterableDataset
+from torch.utils.data import BatchSampler, DataLoader, IterableDataset, TensorDataset
 
 from accelerate import Accelerator, PartialState
 from accelerate.data_loader import (
@@ -725,6 +725,81 @@ class DataLoaderTester(AccelerateTestCase):
         assert accelerator_ref() is None
         assert dataloader_ref() is None
         assert gradient_state_ref() is None
+
+    def test_tail_batch_attribution(self):
+        # Check the tail batch attribution report for a non-divisible dataset (5 samples, batch_size=2, 2 ranks).
+        batch_sampler = BatchSampler(range(5), batch_size=2, drop_last=False)
+        shards = [
+            BatchSamplerShard(batch_sampler, num_processes=2, process_index=i, even_batches=True) for i in range(2)
+        ]
+        expected_attribution = [
+            {"valid": 1, "padding": 1},
+            {"valid": 0, "padding": 2},
+        ]
+        for shard in shards:
+            assert shard.tail_batch_attribution() == expected_attribution
+
+        # Check the iteration order is unchanged after computing the report.
+        batches_before = [list(shard) for shard in shards]
+        for shard in shards:
+            _ = shard.tail_batch_attribution()
+        batches_after = [list(shard) for shard in shards]
+        assert batches_before == batches_after
+
+        # Check the tail batch attribution report for an empty dataset.
+        batch_sampler = BatchSampler(range(0), batch_size=2, drop_last=False)
+        shards = [
+            BatchSamplerShard(batch_sampler, num_processes=2, process_index=i, even_batches=True) for i in range(2)
+        ]
+        expected_empty = [
+            {"valid": 0, "padding": 0},
+            {"valid": 0, "padding": 0},
+        ]
+        for shard in shards:
+            assert shard.tail_batch_attribution() == expected_empty
+
+        # Check the tail batch attribution report for a perfectly divisible dataset (4 samples).
+        batch_sampler = BatchSampler(range(4), batch_size=2, drop_last=False)
+        shards = [
+            BatchSamplerShard(batch_sampler, num_processes=2, process_index=i, even_batches=True) for i in range(2)
+        ]
+        for shard in shards:
+            assert shard.tail_batch_attribution() == expected_empty
+
+        # Check the tail batch attribution report with drop_last=True (no padding).
+        batch_sampler = BatchSampler(range(5), batch_size=2, drop_last=True)
+        shards = [
+            BatchSamplerShard(batch_sampler, num_processes=2, process_index=i, even_batches=True) for i in range(2)
+        ]
+        for shard in shards:
+            assert shard.tail_batch_attribution() == expected_empty
+
+    def test_tail_batch_attribution_dataloader_shard(self):
+        # Check the tail batch attribution report on a prepared DataLoaderShard.
+        dataset = TensorDataset(torch.arange(5))
+        dataloader = DataLoader(dataset, batch_size=2, shuffle=False)
+        prepared = prepare_data_loader(dataloader, num_processes=2, process_index=0)
+        expected_attribution = [
+            {"valid": 1, "padding": 1},
+            {"valid": 0, "padding": 2},
+        ]
+        assert prepared.tail_batch_attribution() == expected_attribution
+
+        # Check the iteration order is unchanged after computing the report.
+        batches_before = [batch[0].tolist() for batch in prepared]
+        _ = prepared.tail_batch_attribution()
+        batches_after = [batch[0].tolist() for batch in prepared]
+        assert batches_before == batches_after
+
+        # Check the tail batch attribution report for an empty dataset.
+        empty_dataset = TensorDataset(torch.empty(0, dtype=torch.long))
+        empty_dataloader = DataLoader(empty_dataset, batch_size=2, shuffle=False)
+        prepared_empty = prepare_data_loader(empty_dataloader, num_processes=2, process_index=0)
+        expected_empty = [
+            {"valid": 0, "padding": 0},
+            {"valid": 0, "padding": 0},
+        ]
+        assert prepared_empty.tail_batch_attribution() == expected_empty
 
 
 class StatefulDataLoaderTester(AccelerateTestCase):

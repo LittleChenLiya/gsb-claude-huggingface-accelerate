@@ -188,6 +188,73 @@ class BatchSamplerShard(BatchSampler):
     def __iter__(self):
         return self._iter_with_split() if self.split_batches else self._iter_with_no_split()
 
+    def _total_samples(self):
+        """
+        Compute the total number of samples in the underlying dataset without consuming the shard's iterator.
+
+        For a standard `BatchSampler`, the underlying sampler exposes the dataset length. For custom batch
+        samplers that do not expose a length, the sampler is consumed to count the samples.
+        """
+        batch_sampler = self.batch_sampler
+        # For a standard BatchSampler, the sampler has the total length.
+        if hasattr(batch_sampler, "sampler") and hasattr(batch_sampler.sampler, "__len__"):
+            return len(batch_sampler.sampler)
+        # Fallback: sum the batch sizes. This consumes the underlying sampler, so it should only be used when
+        # the total length cannot be determined otherwise.
+        return sum(len(batch) for batch in batch_sampler)
+
+    def tail_batch_attribution(self):
+        """
+        Returns the tail batch attribution report for this shard.
+
+        When sharding a dataset across several processes with `even_batches=True`, the last (tail) batch is
+        padded with samples from the beginning of the dataset so that every process sees a full batch. This
+        report lists, for each process (rank), the number of **valid** samples (samples that are genuinely part
+        of the dataset remainder) and the number of **padding** samples (samples duplicated from the beginning).
+
+        The report is purely informational: computing it does not consume or alter the shard's iterator, so the
+        iteration order is left unchanged.
+
+        Returns:
+            list[dict]: A list of length `num_processes`, where each element is a dict with keys:
+
+                - **valid** (`int`): The number of valid samples in the tail batch for this rank.
+                - **padding** (`int`): The number of padding samples in the tail batch for this rank.
+
+            For an empty dataset or a dataset that is perfectly divisible by the total batch size, every rank
+            reports `{"valid": 0, "padding": 0}`.
+        """
+        num_processes = self.num_processes
+
+        # If we drop the last batch or don't even it out, there's no padding.
+        if self.drop_last or not self.even_batches:
+            return [{"valid": 0, "padding": 0} for _ in range(num_processes)]
+
+        # Compute the total number of samples in the underlying dataset.
+        total_samples = self._total_samples()
+        if total_samples == 0:
+            # Empty dataset: no tail batch.
+            return [{"valid": 0, "padding": 0} for _ in range(num_processes)]
+
+        total_batch_size = self.batch_size * num_processes
+        valid_in_tail = total_samples % total_batch_size
+
+        if valid_in_tail == 0:
+            # The last batch is full (or the dataset is empty): no padding.
+            return [{"valid": 0, "padding": 0} for _ in range(num_processes)]
+
+        # The tail batch consists of `valid_in_tail` valid samples followed by `total_batch_size - valid_in_tail`
+        # padding samples (taken from the beginning of the dataset).
+        report = []
+        for rank in range(num_processes):
+            rank_start = rank * self.batch_size
+            rank_end = rank_start + self.batch_size
+            # Valid samples occupy positions [0, valid_in_tail) in the tail batch.
+            valid = max(0, min(rank_end, valid_in_tail) - rank_start)
+            padding = self.batch_size - valid
+            report.append({"valid": valid, "padding": padding})
+        return report
+
     def _iter_with_split(self):
         initial_data = []
         batch_length = self.batch_sampler.batch_size // self.num_processes
@@ -336,6 +403,60 @@ class IterableDatasetShard(IterableDataset):
             return (len(self.dataset) // (self.batch_size * self.num_processes)) * self.batch_size
         else:
             return math.ceil(len(self.dataset) / (self.batch_size * self.num_processes)) * self.batch_size
+
+    def tail_batch_attribution(self):
+        """
+        Returns the tail batch attribution report for this shard.
+
+        When sharding an iterable dataset across several processes with `drop_last=False`, the last (tail)
+        batch is padded with samples from the beginning of the dataset so that every process sees a full batch.
+        This report lists, for each process (rank), the number of **valid** samples (samples that are genuinely
+        part of the dataset remainder) and the number of **padding** samples (samples duplicated from the
+        beginning).
+
+        The report is purely informational: computing it does not consume or alter the shard's iterator, so the
+        iteration order is left unchanged.
+
+        Returns:
+            list[dict]: A list of length `num_processes`, where each element is a dict with keys:
+
+                - **valid** (`int`): The number of valid samples in the tail batch for this rank.
+                - **padding** (`int`): The number of padding samples in the tail batch for this rank.
+
+            For an empty dataset or a dataset that is perfectly divisible by the total batch size, every rank
+            reports `{"valid": 0, "padding": 0}`. Returns `None` if the underlying dataset is unsized (its length
+            cannot be determined).
+        """
+        num_processes = self.num_processes
+
+        if self.drop_last:
+            return [{"valid": 0, "padding": 0} for _ in range(num_processes)]
+
+        try:
+            total_samples = len(self.dataset)
+        except TypeError:
+            # Unsized iterable dataset: the tail batch attribution cannot be determined.
+            return None
+
+        if total_samples == 0:
+            return [{"valid": 0, "padding": 0} for _ in range(num_processes)]
+
+        real_batch_size = self.batch_size if self.split_batches else (self.batch_size * num_processes)
+        valid_in_tail = total_samples % real_batch_size
+
+        if valid_in_tail == 0:
+            return [{"valid": 0, "padding": 0} for _ in range(num_processes)]
+
+        process_batch_size = (self.batch_size // num_processes) if self.split_batches else self.batch_size
+
+        report = []
+        for rank in range(num_processes):
+            rank_start = rank * process_batch_size
+            rank_end = rank_start + process_batch_size
+            valid = max(0, min(rank_end, valid_in_tail) - rank_start)
+            padding = process_batch_size - valid
+            report.append({"valid": valid, "padding": padding})
+        return report
 
     def __iter__(self):
         if (
@@ -653,6 +774,31 @@ class DataLoaderShard(DataLoaderAdapter, DataLoaderStateMixin):
             return self.dataset.total_length
         else:
             return len(self.dataset)
+
+    def tail_batch_attribution(self):
+        """
+        Returns the tail batch attribution report for this shard.
+
+        This is a convenience wrapper that delegates to the underlying shard's report. The report lists, for
+        each process (rank), the number of **valid** samples and the number of **padding** samples in the last
+        (tail) batch. Computing the report does not consume or alter the shard's iterator, so the iteration
+        order is left unchanged.
+
+        Returns:
+            list[dict]: A list of length `num_processes`, where each element is a dict with keys "valid" and
+            "padding". Returns `None` if the underlying shard cannot determine the attribution (e.g. an unsized
+            iterable dataset).
+        """
+        # The sharding is performed either by a `BatchSamplerShard` (map-style datasets) or an
+        # `IterableDatasetShard` (iterable datasets).
+        if isinstance(self.batch_sampler, BatchSamplerShard):
+            return self.batch_sampler.tail_batch_attribution()
+        if isinstance(self.sampler, BatchSamplerShard):
+            return self.sampler.tail_batch_attribution()
+        if isinstance(self.dataset, IterableDatasetShard):
+            return self.dataset.tail_batch_attribution()
+        # No sharding: every rank sees the full dataset with no padding.
+        return [{"valid": 0, "padding": 0} for _ in range(getattr(self.batch_sampler, "num_processes", 1))]
 
     def get_sampler(self):
         return get_sampler(self)
@@ -981,6 +1127,27 @@ class DataLoaderDispatcher(DataLoaderAdapter, DataLoaderStateMixin):
     @property
     def total_dataset_length(self):
         return len(self.dataset)
+
+    def tail_batch_attribution(self):
+        """
+        Returns the tail batch attribution report for this dispatcher.
+
+        This is a convenience wrapper that delegates to the underlying shard's report. The report lists, for
+        each process (rank), the number of **valid** samples and the number of **padding** samples in the last
+        (tail) batch. Computing the report does not consume or alter the shard's iterator, so the iteration
+        order is left unchanged.
+
+        Returns:
+            list[dict]: A list of length `num_processes`, where each element is a dict with keys "valid" and
+            "padding". Returns `None` if the underlying shard cannot determine the attribution (e.g. an unsized
+            iterable dataset).
+        """
+        if isinstance(self.batch_sampler, BatchSamplerShard):
+            return self.batch_sampler.tail_batch_attribution()
+        if isinstance(self.dataset, IterableDatasetShard):
+            return self.dataset.tail_batch_attribution()
+        # No sharding: every rank sees the full dataset with no padding.
+        return [{"valid": 0, "padding": 0} for _ in range(self.state.num_processes)]
 
     def get_sampler(self):
         return get_sampler(self)
