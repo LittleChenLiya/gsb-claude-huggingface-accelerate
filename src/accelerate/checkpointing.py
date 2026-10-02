@@ -43,6 +43,13 @@ from .utils import (
     load,
     save,
 )
+from .utils.random import (
+    RNG_STATE_DIGEST_KEY,
+    RNG_STATE_KEYS_KEY,
+    RNG_STATE_RANK_KEY,
+    compute_rng_states_checksum,
+    verify_rng_states,
+)
 
 
 if is_torch_version(">=", "2.4.0"):
@@ -174,6 +181,13 @@ def save_accelerator_state(
         states["torch_cuda_manual_seed"] = torch.cuda.get_rng_state_all()
     if is_torch_xla_available():
         states["xm_seed"] = xm.get_rng_state()
+    # Verification envelope: record the owning rank, the entries covered by
+    # the checksum, and a SHA-256 digest. Old loaders that don't know these
+    # keys simply ignore them.
+    rng_state_keys = [key for key in states if key != "step"]
+    states[RNG_STATE_RANK_KEY] = int(process_index)
+    states[RNG_STATE_KEYS_KEY] = rng_state_keys
+    states[RNG_STATE_DIGEST_KEY] = compute_rng_states_checksum(states, rng_state_keys)
     output_states_file = output_dir.joinpath(states_name)
     torch.save(states, output_states_file)
     logger.info(f"Random states saved in {output_states_file}")
@@ -292,6 +306,15 @@ def load_accelerator_state(
     # Random states
     try:
         states = load(input_dir.joinpath(f"{RNG_STATE_NAME}_{process_index}.pkl"))
+        # Verify the envelope (rank swap / corruption) before touching any
+        # RNG, so a failed check cannot partially overwrite live RNG states.
+        # Old checkpoints without the metadata are restored as before.
+        if RNG_STATE_DIGEST_KEY in states:
+            verify_rng_states(
+                states,
+                rank=process_index,
+                keys=states.get(RNG_STATE_KEYS_KEY),
+            )
         if "step" in states:
             override_attributes["step"] = states["step"]
         random.setstate(states["random_state"])
